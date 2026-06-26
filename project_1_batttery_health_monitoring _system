@@ -1,0 +1,370 @@
+// ═══════════════════════════════════════════════════════
+//  Adaptive Multi-Cell Battery Intelligence Engine
+//  Hardware only — no WiFi, no Blynk
+//  Hardware : ESP32 DevKit V1
+//  Display  : 16x2 I2C LCD (PCF8574, 0x27)
+//  Cells    : 4x potentiometers → GPIO 34,35,32,33
+//  Button   : GPIO 18 (pull-down, cycles LCD pages)
+//  LEDs     : GPIO 4(Green) 2(Yellow) 15(Orange) 5(Red)
+//  Output   : LCD + LEDs + Serial Monitor @ 115200
+// ═══════════════════════════════════════════════════════
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ── Hardware config ───────────────────────────────────
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define NUM_CELLS       4
+#define BTN_PIN         18
+#define ADC_BITS        12
+#define ADC_MAX         4095.0f
+#define V_MIN           2.5f
+#define V_MAX           4.2f
+#define OVERSAMPLE      8
+#define DEBOUNCE_MS     200
+#define SAMPLE_INTERVAL 2000
+
+// LED pins
+#define LED_GREEN   4    // HEALTHY
+#define LED_YELLOW  2    // MINOR IMBALANCE
+#define LED_ORANGE  15   // CRITICAL IMBALANCE
+#define LED_RED     5    // PACK FAILURE
+
+const int ADC_PINS[NUM_CELLS] = {34, 35, 32, 33};
+
+// ── Custom LCD characters ─────────────────────────────
+byte iconBattery[8] = {0x0E,0x1F,0x11,0x1F,0x1F,0x1F,0x1F,0x00};
+byte iconWarn[8]    = {0x04,0x0E,0x0E,0x1F,0x1F,0x0E,0x04,0x00};
+byte iconUp[8]      = {0x04,0x0E,0x15,0x04,0x04,0x04,0x04,0x00};
+byte iconDown[8]    = {0x04,0x04,0x04,0x04,0x15,0x0E,0x04,0x00};
+
+// ── Data structures ───────────────────────────────────
+struct CellData {
+  int   adcRaw;
+  float voltage;
+  float imbalancePct;
+  float socPct;
+  bool  isWeakest;
+  bool  isStrongest;
+  bool  underVoltage;
+  bool  overVoltage;
+};
+
+enum HealthState {
+  HEALTHY            = 0,
+  MINOR_IMBALANCE    = 1,
+  CRITICAL_IMBALANCE = 2,
+  PACK_FAILURE       = 3
+};
+
+struct PackData {
+  float       packVoltage;
+  float       avgVoltage;
+  float       imbalancePct;
+  float       deltaVmV;
+  float       avgSoc;
+  int         weakestCell;
+  int         strongestCell;
+  HealthState health;
+};
+
+// ── Global state ──────────────────────────────────────
+CellData      cells[NUM_CELLS];
+PackData      pack;
+int           currentPage    = 0;
+const int     TOTAL_PAGES    = 6;
+bool          lastBtnState   = LOW;
+unsigned long lastDebounce   = 0;
+unsigned long lastSample     = 0;
+unsigned long sampleCount    = 0;
+
+// ── Module 1: ADC ─────────────────────────────────────
+int oversampleADC(int pin) {
+  long sum = 0;
+  for (int i = 0; i < OVERSAMPLE; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return (int)(sum / OVERSAMPLE);
+}
+
+float adcToVoltage(int raw) {
+  return V_MIN + (raw / ADC_MAX) * (V_MAX - V_MIN);
+}
+
+float estimateSoc(float v) {
+  float s = (v - V_MIN) / (V_MAX - V_MIN) * 100.0f;
+  return constrain(s, 0.0f, 100.0f);
+}
+
+// ── Module 2: Measurement ─────────────────────────────
+void readAndCompute() {
+  float vMin = 9999.0f, vMax = -9999.0f, vSum = 0.0f;
+  int   weakIdx = 0, strongIdx = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+    cells[i].adcRaw       = oversampleADC(ADC_PINS[i]);
+    cells[i].voltage      = adcToVoltage(cells[i].adcRaw);
+    cells[i].socPct       = estimateSoc(cells[i].voltage);
+    cells[i].underVoltage = (cells[i].voltage < 2.8f);
+    cells[i].overVoltage  = (cells[i].voltage > 4.15f);
+    vSum += cells[i].voltage;
+    if (cells[i].voltage < vMin) { vMin = cells[i].voltage; weakIdx   = i; }
+    if (cells[i].voltage > vMax) { vMax = cells[i].voltage; strongIdx = i; }
+  }
+
+  pack.packVoltage   = vSum;
+  pack.avgVoltage    = vSum / NUM_CELLS;
+  pack.imbalancePct  = ((vMax - vMin) / pack.avgVoltage) * 100.0f;
+  pack.deltaVmV      = (vMax - vMin) * 1000.0f;
+  pack.weakestCell   = weakIdx;
+  pack.strongestCell = strongIdx;
+
+  float socSum = 0.0f;
+  for (int i = 0; i < NUM_CELLS; i++) {
+    cells[i].imbalancePct = (fabsf(cells[i].voltage - pack.avgVoltage)
+                              / pack.avgVoltage) * 100.0f;
+    cells[i].isWeakest    = (i == weakIdx);
+    cells[i].isStrongest  = (i == strongIdx);
+    socSum += cells[i].socPct;
+  }
+  pack.avgSoc = socSum / NUM_CELLS;
+
+  // Health FSM
+  bool anyUV = false;
+  for (int i = 0; i < NUM_CELLS; i++)
+    if (cells[i].underVoltage) anyUV = true;
+
+  if (anyUV)                          pack.health = PACK_FAILURE;
+  else if (pack.imbalancePct > 10.0f) pack.health = CRITICAL_IMBALANCE;
+  else if (pack.imbalancePct > 3.0f)  pack.health = MINOR_IMBALANCE;
+  else                                pack.health = HEALTHY;
+}
+
+// ── Module 3: LED indicator ───────────────────────────
+void updateLEDs() {
+  // Turn all off first, then light only the active one
+  digitalWrite(LED_GREEN,  LOW);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_ORANGE, LOW);
+  digitalWrite(LED_RED,    LOW);
+
+  switch (pack.health) {
+    case HEALTHY:
+      digitalWrite(LED_GREEN, HIGH);
+      break;
+    case MINOR_IMBALANCE:
+      digitalWrite(LED_YELLOW, HIGH);
+      break;
+    case CRITICAL_IMBALANCE:
+      digitalWrite(LED_ORANGE, HIGH);
+      break;
+    case PACK_FAILURE:
+      digitalWrite(LED_RED, HIGH);
+      break;
+  }
+}
+
+// ── Module 4: Serial report ───────────────────────────
+void serialReport() {
+  sampleCount++;
+  Serial.println(F("══════════════════════════════════════════════"));
+  Serial.printf("  Sample #%lu\n", sampleCount);
+  Serial.println(F("  Cell │ Voltage  │ Imbal%  │ SOC%  │ Status"));
+  Serial.println(F("  ─────┼──────────┼─────────┼───────┼────────"));
+  for (int i = 0; i < NUM_CELLS; i++) {
+    const char* tag = "  OK   ";
+    if (cells[i].isStrongest)  tag = " BEST  ";
+    if (cells[i].isWeakest)    tag = " WEAK  ";
+    if (cells[i].underVoltage) tag = "  UV!  ";
+    if (cells[i].overVoltage)  tag = "  OV!  ";
+    Serial.printf("    %d  │  %.3fV  │  %5.2f%%  │ %4.1f%% │%s\n",
+      i + 1, cells[i].voltage,
+      cells[i].imbalancePct,
+      cells[i].socPct, tag);
+  }
+  Serial.println();
+  Serial.printf("  Pack    : %.3f V\n", pack.packVoltage);
+  Serial.printf("  Average : %.3f V\n", pack.avgVoltage);
+  Serial.printf("  Delta V : %.1f mV\n", pack.deltaVmV);
+  Serial.printf("  Imbal   : %.2f%%\n", pack.imbalancePct);
+  Serial.printf("  Avg SoC : %.1f%%\n", pack.avgSoc);
+  Serial.printf("  Weakest : Cell %d (%.3fV)\n",
+    pack.weakestCell + 1, cells[pack.weakestCell].voltage);
+  Serial.printf("  Strongest: Cell %d (%.3fV)\n",
+    pack.strongestCell + 1, cells[pack.strongestCell].voltage);
+  const char* hlabels[] = {
+    "HEALTHY", "MINOR IMBALANCE",
+    "CRITICAL IMBALANCE", "PACK FAILURE"
+  };
+  Serial.printf("  Health  : %s\n", hlabels[pack.health]);
+  Serial.println(F("══════════════════════════════════════════════\n"));
+}
+
+// ── Module 5: LCD pages ───────────────────────────────
+void lcdPackOverview() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.write(byte(0));
+  lcd.print(" ");
+  lcd.print(pack.packVoltage, 2);
+  lcd.print("V ");
+  lcd.print((int)pack.avgSoc);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  switch (pack.health) {
+    case HEALTHY:
+      lcd.print("Status:HEALTHY  ");
+      break;
+    case MINOR_IMBALANCE:
+      lcd.write(byte(1));
+      lcd.print("MINOR IMBAL    ");
+      break;
+    case CRITICAL_IMBALANCE:
+      lcd.write(byte(1));
+      lcd.print("CRIT IMBALANCE ");
+      break;
+    case PACK_FAILURE:
+      lcd.write(byte(1));
+      lcd.print("PACK FAILURE!  ");
+      break;
+  }
+}
+
+void lcdCellPage(int idx) {
+  lcd.clear();
+  CellData& c = cells[idx];
+
+  lcd.setCursor(0, 0);
+  lcd.print("C");
+  lcd.print(idx + 1);
+  lcd.print(":");
+  lcd.print(c.voltage, 3);
+  lcd.print("V ");
+  lcd.print((int)c.socPct);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  if (c.underVoltage) {
+    lcd.write(byte(1));
+    lcd.print("UV!  Imb:");
+    lcd.print(c.imbalancePct, 1);
+    lcd.print("%");
+  } else if (c.isStrongest) {
+    lcd.write(byte(2));
+    lcd.print("BEST Imb:");
+    lcd.print(c.imbalancePct, 1);
+    lcd.print("%");
+  } else if (c.isWeakest) {
+    lcd.write(byte(3));
+    lcd.print("WEAK Imb:");
+    lcd.print(c.imbalancePct, 1);
+    lcd.print("%");
+  } else {
+    lcd.print("OK   Imb:");
+    lcd.print(c.imbalancePct, 1);
+    lcd.print("%");
+  }
+}
+
+void lcdStrongestPage() {
+  lcd.clear();
+  int s = pack.strongestCell;
+  lcd.setCursor(0, 0);
+  lcd.write(byte(2));
+  lcd.print("BEST:C");
+  lcd.print(s + 1);
+  lcd.print(" ");
+  lcd.print(cells[s].voltage, 3);
+  lcd.print("V");
+
+  lcd.setCursor(0, 1);
+  lcd.print("dV:");
+  lcd.print((int)pack.deltaVmV);
+  lcd.print("mV S:");
+  lcd.print((int)cells[s].socPct);
+  lcd.print("%");
+}
+
+void renderPage() {
+  if      (currentPage == 0)                     lcdPackOverview();
+  else if (currentPage >= 1 && currentPage <= 4) lcdCellPage(currentPage - 1);
+  else if (currentPage == 5)                     lcdStrongestPage();
+}
+
+// ── Module 6: Button ──────────────────────────────────
+void checkButton() {
+  bool state = digitalRead(BTN_PIN);
+  if (state == HIGH && lastBtnState == LOW) {
+    unsigned long now = millis();
+    if (now - lastDebounce > DEBOUNCE_MS) {
+      currentPage  = (currentPage + 1) % TOTAL_PAGES;
+      renderPage();
+      lastDebounce = now;
+    }
+  }
+  lastBtnState = state;
+}
+
+// ── Setup ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  analogReadResolution(ADC_BITS);
+  analogSetAttenuation(ADC_11db);
+  for (int i = 0; i < NUM_CELLS; i++)
+    pinMode(ADC_PINS[i], INPUT);
+
+  pinMode(BTN_PIN, INPUT);
+
+  // LED pin setup
+  pinMode(LED_GREEN,  OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_ORANGE, OUTPUT);
+  pinMode(LED_RED,    OUTPUT);
+  digitalWrite(LED_GREEN,  LOW);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_ORANGE, LOW);
+  digitalWrite(LED_RED,    LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, iconBattery);
+  lcd.createChar(1, iconWarn);
+  lcd.createChar(2, iconUp);
+  lcd.createChar(3, iconDown);
+
+  // Splash
+  lcd.setCursor(0, 0);
+  lcd.print(" Battery Engine ");
+  lcd.setCursor(0, 1);
+  lcd.print("  4-Cell Li-ion ");
+  delay(2000);
+
+  // First read
+  readAndCompute();
+  updateLEDs();
+  renderPage();
+  serialReport();
+
+  lastSample = millis();
+  Serial.println(F("System ready. Press button to cycle pages."));
+}
+
+// ── Main loop ─────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastSample >= SAMPLE_INTERVAL) {
+    readAndCompute();
+    updateLEDs();
+    renderPage();
+    serialReport();
+    lastSample = now;
+  }
+
+  checkButton();
+}
