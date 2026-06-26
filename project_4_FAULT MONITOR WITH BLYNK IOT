@@ -1,0 +1,799 @@
+/********************************************************
+ * Intelligent Cloud Telemetry Architecture
+ * ESP32 + Blynk + LCD + 4 Cell Monitor
+ ********************************************************/
+#define BLYNK_TEMPLATE_ID "TMPL3FeEUHAVQ"
+#define BLYNK_TEMPLATE_NAME "battery monitor task4"
+#define BLYNK_AUTH_TOKEN "aAvNGb9HfbMt1u6mfs7NeTK_mUdGDZRE"
+
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+
+
+
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+// ADC Inputs
+#define NUM_CELLS 4
+
+const int ADC_PINS[NUM_CELLS] =
+{
+  34,
+  35,
+  32,
+  33
+};
+
+// Voltage limits
+
+#define ADC_MAX 4095.0f
+
+#define V_MIN 2.5f
+#define V_MAX 4.2f
+
+#define WEAK_THRESH 2.8f
+#define OV_THRESH   4.15f
+
+#define POLL_INTERVAL 100
+
+// RSSI Check
+
+#define RSSI_CHECK_MS 5000
+
+// WiFi reconnect
+
+#define WIFI_RETRY_MS 10000
+
+// Telemetry
+
+#define TELEMETRY_INTERVAL 1000
+
+// Health States
+
+enum HealthState
+{
+  HEALTHY,
+  MINOR_IMBALANCE,
+  CRITICAL_IMBALANCE,
+  LOW_BATTERY,
+  PACK_FAILURE,
+  FAULT_STATE
+};
+
+HealthState currentHealth = HEALTHY;
+HealthState previousHealth = HEALTHY;
+
+// Cell Data
+
+struct CellData
+{
+  float voltage;
+  float soc;
+  float imbalance;
+};
+
+CellData cells[NUM_CELLS];
+
+// Pack Data
+
+struct PackData
+{
+  float packVoltage;
+  float avgVoltage;
+  float avgSoc;
+  float imbalancePct;
+
+  int weakestCell;
+  int strongestCell;
+};
+
+PackData pack;
+
+// Monitoring
+
+float previousVoltage[NUM_CELLS];
+
+int previousWeakest = -1;
+int previousStrongest = -1;
+
+// RSSI
+
+String currentRSSIState = "";
+String previousRSSIState = "";
+
+// Timers
+
+unsigned long lastPoll = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastRSSICheck = 0;
+unsigned long lastWiFiRetry = 0;
+
+// Event Queue
+
+#define MAX_EVENTS 30
+
+struct EventItem
+{
+  String message;
+};
+
+EventItem eventQueue[MAX_EVENTS];
+
+int queueHead = 0;
+int queueTail = 0;
+
+//====================================================
+// Queue Functions
+//====================================================
+
+bool queueEmpty()
+{
+  return queueHead == queueTail;
+}
+
+bool queueFull()
+{
+  return ((queueTail + 1) % MAX_EVENTS) == queueHead;
+}
+
+void pushEvent(String msg)
+{
+  if(queueFull())
+    return;
+
+  eventQueue[queueTail].message = msg;
+
+  queueTail =
+  (queueTail + 1) % MAX_EVENTS;
+
+  Serial.println(msg);
+}
+
+String popEvent()
+{
+  if(queueEmpty())
+    return "";
+
+  String msg =
+  eventQueue[queueHead].message;
+
+  queueHead =
+  (queueHead + 1) % MAX_EVENTS;
+
+  return msg;
+}
+
+//====================================================
+// Voltage to SOC
+//====================================================
+
+float voltageToSOC(float v)
+{
+  float soc =
+  ((v - V_MIN) /
+  (V_MAX - V_MIN)) * 100.0;
+
+  if(soc < 0) soc = 0;
+  if(soc > 100) soc = 100;
+
+  return soc;
+}
+
+//====================================================
+// RSSI State
+//====================================================
+
+String getRSSIState(int rssi)
+{
+  if(rssi > -60)
+    return "Excellent";
+
+  if(rssi > -70)
+    return "Good";
+
+  if(rssi > -80)
+    return "Weak";
+
+  return "Poor";
+}
+
+
+
+
+
+//====================================================
+// Read Battery Data
+//====================================================
+
+void readBatteryData()
+{
+  float sum = 0;
+
+  float minV = 999;
+  float maxV = -999;
+
+  int weakIdx = 0;
+  int strongIdx = 0;
+
+  for(int i=0;i<NUM_CELLS;i++)
+  {
+    int raw = analogRead(ADC_PINS[i]);
+
+    float voltage =
+      V_MIN +
+      ((float)raw / ADC_MAX) *
+      (V_MAX - V_MIN);
+
+    cells[i].voltage = voltage;
+    cells[i].soc = voltageToSOC(voltage);
+
+    sum += voltage;
+
+    if(voltage < minV)
+    {
+      minV = voltage;
+      weakIdx = i;
+    }
+
+    if(voltage > maxV)
+    {
+      maxV = voltage;
+      strongIdx = i;
+    }
+  }
+
+  pack.packVoltage = sum;
+  pack.avgVoltage = sum / NUM_CELLS;
+
+  pack.weakestCell = weakIdx;
+  pack.strongestCell = strongIdx;
+
+  pack.imbalancePct =
+    ((maxV - minV) /
+    pack.avgVoltage) * 100.0;
+
+  float socSum = 0;
+
+  for(int i=0;i<NUM_CELLS;i++)
+  {
+    cells[i].imbalance =
+      fabs(
+      cells[i].voltage -
+      pack.avgVoltage)
+      / pack.avgVoltage * 100.0;
+
+    socSum += cells[i].soc;
+  }
+
+  pack.avgSoc =
+    socSum / NUM_CELLS;
+}
+
+//====================================================
+// Determine Health State
+//====================================================
+
+HealthState determineHealth()
+{
+  bool fault = false;
+
+  for(int i=0;i<NUM_CELLS;i++)
+  {
+    if(cells[i].voltage < WEAK_THRESH)
+      fault = true;
+
+    if(cells[i].voltage > OV_THRESH)
+      fault = true;
+  }
+
+  if(fault)
+    return FAULT_STATE;
+
+  if(pack.avgSoc <= 5)
+    return PACK_FAILURE;
+
+  if(pack.avgSoc <= 20)
+    return LOW_BATTERY;
+
+  if(pack.imbalancePct > 10)
+    return CRITICAL_IMBALANCE;
+
+  if(pack.imbalancePct > 3)
+    return MINOR_IMBALANCE;
+
+  return HEALTHY;
+}
+
+//====================================================
+// Health Label
+//====================================================
+
+String healthLabel(HealthState state)
+{
+  switch(state)
+  {
+    case HEALTHY:
+      return "Healthy";
+
+    case MINOR_IMBALANCE:
+      return "Minor Imbalance";
+
+    case CRITICAL_IMBALANCE:
+      return "Critical Imbalance";
+
+    case LOW_BATTERY:
+      return "Low Battery";
+
+    case PACK_FAILURE:
+      return "Pack Failure";
+
+    case FAULT_STATE:
+      return "Fault";
+
+    default:
+      return "Unknown";
+  }
+}
+
+//====================================================
+// Health Change Events
+//====================================================
+
+void checkHealthEvents()
+{
+  currentHealth =
+    determineHealth();
+
+  if(currentHealth != previousHealth)
+  {
+    pushEvent(
+      "Health -> " +
+      healthLabel(currentHealth));
+
+    previousHealth =
+      currentHealth;
+  }
+}
+
+//====================================================
+// Weakest Cell Changed
+//====================================================
+
+void checkWeakestCellChange()
+{
+  if(previousWeakest == -1)
+  {
+    previousWeakest =
+    pack.weakestCell;
+
+    return;
+  }
+
+  if(pack.weakestCell != previousWeakest)
+  {
+    pushEvent(
+      "Weakest Cell -> C" +
+      String(pack.weakestCell + 1));
+
+    previousWeakest =
+      pack.weakestCell;
+  }
+}
+
+//====================================================
+// Strongest Cell Changed
+//====================================================
+
+void checkStrongestCellChange()
+{
+  if(previousStrongest == -1)
+  {
+    previousStrongest =
+    pack.strongestCell;
+
+    return;
+  }
+
+  if(pack.strongestCell != previousStrongest)
+  {
+    pushEvent(
+      "Strongest Cell -> C" +
+      String(pack.strongestCell + 1));
+
+    previousStrongest =
+      pack.strongestCell;
+  }
+}
+
+//====================================================
+// Voltage Threshold Events
+//====================================================
+
+void checkVoltageEvents()
+{
+  for(int i=0;i<NUM_CELLS;i++)
+  {
+    float v =
+      cells[i].voltage;
+
+    float pv =
+      previousVoltage[i];
+
+    if(pv >= WEAK_THRESH &&
+       v < WEAK_THRESH)
+    {
+      pushEvent(
+      "Cell " +
+      String(i+1) +
+      " UNDERVOLTAGE");
+    }
+
+    if(pv <= OV_THRESH &&
+       v > OV_THRESH)
+    {
+      pushEvent(
+      "Cell " +
+      String(i+1) +
+      " OVERVOLTAGE");
+    }
+
+    previousVoltage[i] = v;
+  }
+}
+
+//====================================================
+// Master Event Scanner
+//====================================================
+
+void processBatteryEvents()
+{
+  checkHealthEvents();
+
+  checkWeakestCellChange();
+
+  checkStrongestCellChange();
+
+  checkVoltageEvents();
+}
+
+
+
+
+
+//====================================================
+// WiFi Reconnect Manager
+//====================================================
+
+void handleWiFi()
+{
+  if(WiFi.status() == WL_CONNECTED)
+    return;
+
+  unsigned long now = millis();
+
+  if(now - lastWiFiRetry >= WIFI_RETRY_MS)
+  {
+    Serial.println("WiFi Reconnecting...");
+
+    WiFi.begin(ssid, pass);
+
+    lastWiFiRetry = now;
+  }
+}
+
+//====================================================
+// RSSI Monitoring
+//====================================================
+
+void monitorRSSI()
+{
+  unsigned long now = millis();
+
+  if(now - lastRSSICheck < RSSI_CHECK_MS)
+    return;
+
+  lastRSSICheck = now;
+
+  if(WiFi.status() != WL_CONNECTED)
+    return;
+
+  int rssi = WiFi.RSSI();
+
+  currentRSSIState =
+    getRSSIState(rssi);
+
+  if(currentRSSIState != previousRSSIState)
+  {
+    pushEvent(
+      "RSSI -> " +
+      currentRSSIState +
+      " (" +
+      String(rssi) +
+      " dBm)");
+
+    previousRSSIState =
+      currentRSSIState;
+  }
+}
+
+//====================================================
+// Blynk Connect
+//====================================================
+
+void connectBlynk()
+{
+  if(WiFi.status() != WL_CONNECTED)
+    return;
+
+  if(Blynk.connected())
+    return;
+
+  Blynk.connect(1000);
+}
+
+//====================================================
+// Send Live Data
+//====================================================
+
+void sendLiveData()
+{
+  if(!Blynk.connected())
+    return;
+
+  Blynk.virtualWrite(V0,cells[0].voltage);
+  Blynk.virtualWrite(V1,cells[1].voltage);
+  Blynk.virtualWrite(V2,cells[2].voltage);
+  Blynk.virtualWrite(V3,cells[3].voltage);
+
+  Blynk.virtualWrite(V4,
+                     pack.packVoltage);
+
+  Blynk.virtualWrite(V5,
+                     pack.avgSoc);
+
+  Blynk.virtualWrite(V6,
+                     pack.imbalancePct);
+
+  Blynk.virtualWrite(V7,
+                     healthLabel(currentHealth));
+
+  Blynk.virtualWrite(V8,
+                     WiFi.RSSI());
+}
+
+//====================================================
+// Upload Event Queue
+//====================================================
+
+void syncEventQueue()
+{
+  if(!Blynk.connected())
+    return;
+
+  while(!queueEmpty())
+  {
+    String msg =
+      popEvent();
+
+    Blynk.virtualWrite(V9,msg);
+
+    delay(50);
+  }
+}
+
+//====================================================
+// LCD Page System
+//====================================================
+
+byte lcdPage = 0;
+
+unsigned long lastLCDSwitch = 0;
+
+void updateLCD()
+{
+  if(millis() - lastLCDSwitch > 3000)
+  {
+    lcdPage++;
+
+    if(lcdPage > 4)
+      lcdPage = 0;
+
+    lastLCDSwitch = millis();
+
+    lcd.clear();
+  }
+
+  switch(lcdPage)
+  {
+    case 0:
+
+      lcd.setCursor(0,0);
+      lcd.print("Pack:");
+      lcd.print(pack.packVoltage,2);
+
+      lcd.setCursor(0,1);
+      lcd.print(healthLabel(currentHealth));
+
+      break;
+
+    case 1:
+
+      lcd.setCursor(0,0);
+      lcd.print("C1:");
+      lcd.print(cells[0].voltage,2);
+
+      lcd.setCursor(0,1);
+      lcd.print("C2:");
+      lcd.print(cells[1].voltage,2);
+
+      break;
+
+    case 2:
+
+      lcd.setCursor(0,0);
+      lcd.print("C3:");
+      lcd.print(cells[2].voltage,2);
+
+      lcd.setCursor(0,1);
+      lcd.print("C4:");
+      lcd.print(cells[3].voltage,2);
+
+      break;
+
+    case 3:
+
+      lcd.setCursor(0,0);
+      lcd.print("SOC:");
+      lcd.print(pack.avgSoc,0);
+      lcd.print("%");
+
+      lcd.setCursor(0,1);
+      lcd.print("Imb:");
+      lcd.print(pack.imbalancePct,1);
+      lcd.print("%");
+
+      break;
+
+    case 4:
+
+      lcd.setCursor(0,0);
+      lcd.print("W:C");
+      lcd.print(pack.weakestCell + 1);
+
+      lcd.setCursor(8,0);
+      lcd.print("S:C");
+      lcd.print(pack.strongestCell + 1);
+
+      lcd.setCursor(0,1);
+
+      if(WiFi.status()==WL_CONNECTED)
+        lcd.print("WiFi OK");
+      else
+        lcd.print("WiFi LOST");
+
+      break;
+  }
+}
+
+//====================================================
+// Setup
+//====================================================
+
+void setup()
+{
+
+
+
+
+
+  
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  analogSetAttenuation(ADC_11db);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0,0);
+  lcd.print("Battery Monitor");
+
+  lcd.setCursor(0,1);
+  lcd.print("Cloud Telemetry");
+
+  delay(2000);
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  WiFi.begin(ssid,pass);
+
+  
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  if(Blynk.connect(10000)) {
+    Serial.println("blynk connected");
+
+  } else {
+    Serial.println("blynk connect failed");
+  }
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  for(int i=0;i<NUM_CELLS;i++)
+  {
+    previousVoltage[i] = 3.7;
+  }
+}
+
+//====================================================
+// Loop
+//====================================================
+
+void loop()
+{
+  if(Blynk.connected())
+    Blynk.run();
+
+  handleWiFi();
+
+  connectBlynk();
+
+  unsigned long now = millis();
+
+  if(now - lastPoll >= POLL_INTERVAL)
+  {
+    readBatteryData();
+
+    processBatteryEvents();
+
+    lastPoll = now;
+  }
+
+  monitorRSSI();
+
+  if(now - lastTelemetry >= TELEMETRY_INTERVAL)
+  {
+    sendLiveData();
+
+    syncEventQueue();
+
+    lastTelemetry = now;
+  }
+
+  updateLCD();
+}
