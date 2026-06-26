@@ -1,0 +1,472 @@
+// ═══════════════════════════════════════════════════════
+//  Intelligent Embedded HMI & Diagnostic Interface
+//  Hardware : ESP32 DevKit V1
+//  Display  : 16x2 I2C LCD (PCF8574, 0x27)
+//  Cells    : 4x potentiometers → GPIO 34,35,32,33
+//  Screens  : 4 auto-rotating + fault override
+//  Scroll   : smooth millis()-based slide transition
+// ═══════════════════════════════════════════════════════
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ── Pins ───────────────────────────────────────────────
+#define NUM_CELLS 4
+const int ADC_PINS[NUM_CELLS] = {34, 35, 32, 33};
+
+// ── Voltage thresholds ─────────────────────────────────
+#define ADC_MAX        4095.0f
+#define V_MIN          2.5f
+#define V_MAX          4.2f
+#define WEAK_THRESH    2.8f
+#define OV_THRESH      4.15f
+#define DVDT_THRESH    0.15f
+#define ANOMALY_WINDOW    100
+#define ANOMALY_TOLERANCE 2
+#define ANOMALY_MARGIN    0.10f
+
+// ── Timing ─────────────────────────────────────────────
+#define POLL_INTERVAL      100
+#define DEBOUNCE_TIME      500
+#define COOLDOWN_TIME      3000
+#define SCREEN_ROTATE_MS   4000
+#define LCD_REFRESH_MS     400
+#define TRANSITION_STEPS   16
+#define TRANSITION_STEP_MS 40
+
+// ── Enums ──────────────────────────────────────────────
+enum SafetyState { NORMAL, FAULT_STATE, COOLDOWN_STATE };
+SafetyState safetyState = NORMAL;
+
+enum FaultType { FAULT_NONE, FAULT_WEAK, FAULT_OVERVOLT, FAULT_ANOMALY, FAULT_DVDT };
+FaultType activeFault    = FAULT_NONE;
+int       faultCellIndex = -1;
+
+enum ScreenID {
+  SCR_PACK = 0, SCR_CELLS12 = 1,
+  SCR_CELLS34 = 2, SCR_PROTECT = 3,
+  SCR_FAULT = 4, SCR_COOLDOWN = 5
+};
+const int ROTATE_COUNT = 4;
+ScreenID  currentScreen = SCR_PACK;
+ScreenID  nextScreen    = SCR_PACK;
+bool      faultOverride = false;
+
+enum TxState { TX_IDLE, TX_OUT, TX_BLANK, TX_IN };
+TxState       txState     = TX_IDLE;
+int           txStep      = 0;
+unsigned long tLastTxStep = 0;
+
+char txOldL0[17]="", txOldL1[17]="";
+char txNewL0[17]="", txNewL1[17]="";
+
+// ── Structs ────────────────────────────────────────────
+struct CellData {
+  float voltage, imbalancePct, socPct;
+  bool  isWeakest, isStrongest, underVoltage, overVoltage;
+};
+struct PackData {
+  float packVoltage, avgVoltage, imbalancePct, deltaVmV, avgSoc;
+  int   weakestCell, strongestCell;
+};
+struct CellMonitor {
+  float prevVoltage;
+  unsigned long prevSampleTime;
+  float dVdt;
+  int   stuckCount, lastRawADC;
+};
+
+CellData    cells[NUM_CELLS];
+PackData    pack;
+CellMonitor mon[NUM_CELLS];
+
+// ── Timers & flags ─────────────────────────────────────
+unsigned long tLastPoll=0, tFaultStart=0, tCooldownStart=0;
+unsigned long tLastLCD=0,  tLastRotate=0;
+bool faultLatchedRaw = false;
+
+// ── LCD cache ──────────────────────────────────────────
+char lastLine0[17]="", lastLine1[17]="";
+
+// ── Custom characters ──────────────────────────────────
+byte iconWarn[8] = {0x04,0x0E,0x0E,0x1F,0x1F,0x0E,0x04,0x00};
+
+// ═══════════════════════════════════════════════════════
+//  1. ADC helpers
+// ═══════════════════════════════════════════════════════
+float adcToVoltage(int raw) {
+  return V_MIN + (raw / ADC_MAX) * (V_MAX - V_MIN);
+}
+float estimateSoc(float v) {
+  return constrain((v - V_MIN) / (V_MAX - V_MIN) * 100.0f, 0.0f, 100.0f);
+}
+
+// ═══════════════════════════════════════════════════════
+//  2. Fault label
+// ═══════════════════════════════════════════════════════
+const char* faultLabel(FaultType f) {
+  switch(f) {
+    case FAULT_WEAK:     return "WEAK CELL";
+    case FAULT_OVERVOLT: return "OVERVOLT ";
+    case FAULT_ANOMALY:  return "SENSOR ERR";
+    case FAULT_DVDT:     return "VOLT SPIKE";
+    default:              return "NONE      ";
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  3. Screen content builder
+// ═══════════════════════════════════════════════════════
+void buildScreen(ScreenID scr, char* L0, char* L1) {
+  switch(scr) {
+
+    case SCR_PACK:
+      snprintf(L0,17,"Pk:%.2fV  S:%d%%",
+        pack.packVoltage,(int)pack.avgSoc);
+      snprintf(L1,17,"%-16s",
+        safetyState==FAULT_STATE    ? "!! FAULT !!"  :
+        safetyState==COOLDOWN_STATE ? "Cooldown..."  :
+        pack.imbalancePct>10        ? "CRIT IMBAL"   :
+        pack.imbalancePct>3         ? "Minor Imbal"  : "Healthy");
+      break;
+
+    case SCR_CELLS12: {
+      const char* t1 = cells[0].isWeakest  ? "W" :
+                       cells[0].isStrongest ? "B" : " ";
+      const char* t2 = cells[1].isWeakest  ? "W" :
+                       cells[1].isStrongest ? "B" : " ";
+      snprintf(L0,17,"C1:%.3fV%s%3d%%",cells[0].voltage,t1,(int)cells[0].socPct);
+      snprintf(L1,17,"C2:%.3fV%s%3d%%",cells[1].voltage,t2,(int)cells[1].socPct);
+      break;
+    }
+
+    case SCR_CELLS34: {
+      const char* t3 = cells[2].isWeakest  ? "W" :
+                       cells[2].isStrongest ? "B" : " ";
+      const char* t4 = cells[3].isWeakest  ? "W" :
+                       cells[3].isStrongest ? "B" : " ";
+      snprintf(L0,17,"C3:%.3fV%s%3d%%",cells[2].voltage,t3,(int)cells[2].socPct);
+      snprintf(L1,17,"C4:%.3fV%s%3d%%",cells[3].voltage,t4,(int)cells[3].socPct);
+      break;
+    }
+
+    case SCR_PROTECT:
+      snprintf(L0,17,"dV:%4.0fmV  St:%s",
+        pack.deltaVmV,
+        safetyState==FAULT_STATE    ? "FLT" :
+        safetyState==COOLDOWN_STATE ? "CDN" : "OK ");
+      snprintf(L1,17,"Imb:%5.2f%% W:C%d",
+        pack.imbalancePct, pack.weakestCell+1);
+      break;
+
+    case SCR_FAULT: {
+      int ci = (faultCellIndex>=0) ? faultCellIndex : 0;
+      snprintf(L0,17,"!FAULT C%d %-6s",ci+1,faultLabel(activeFault));
+      snprintf(L1,17,"%.3fV Imb:%.1f%%",
+        cells[ci].voltage,cells[ci].imbalancePct);
+      break;
+    }
+
+    case SCR_COOLDOWN:
+      snprintf(L0,17,"Checking...     ");
+      snprintf(L1,17,"Fault cleared   ");
+      break;
+
+    default:
+      snprintf(L0,17,"                ");
+      snprintf(L1,17,"                ");
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  4. Flicker-free LCD write
+// ═══════════════════════════════════════════════════════
+void lcdWriteIfChanged(uint8_t row, const char* txt) {
+  char* last = (row==0) ? lastLine0 : lastLine1;
+  if (strcmp(txt, last)==0) return;
+  char buf[17];
+  snprintf(buf,17,"%-16s",txt);
+  lcd.setCursor(0,row);
+  lcd.print(buf);
+  strncpy(last,buf,16);
+  last[16]='\0';
+}
+void lcdWrite(const char* L0, const char* L1) {
+  lcdWriteIfChanged(0,L0);
+  lcdWriteIfChanged(1,L1);
+}
+
+// ═══════════════════════════════════════════════════════
+//  5. Transition engine  ← defined BEFORE runStateMachine
+// ═══════════════════════════════════════════════════════
+void startTransition(ScreenID to) {
+  if (faultOverride) return;
+  buildScreen(currentScreen, txOldL0, txOldL1);
+  buildScreen(to,            txNewL0, txNewL1);
+  nextScreen  = to;
+  txStep      = 0;
+  txState     = TX_OUT;
+  tLastTxStep = millis();
+}
+
+void updateTransition(unsigned long now) {
+  if (txState==TX_IDLE) return;
+  if (now - tLastTxStep < TRANSITION_STEP_MS) return;
+  tLastTxStep = now;
+
+  char f0[17], f1[17];
+
+  if (txState==TX_OUT) {
+    int sh = txStep+1;
+    for (int c=0;c<16;c++) {
+      int s=c+sh;
+      f0[c]=(s<16)?txOldL0[s]:' ';
+      f1[c]=(s<16)?txOldL1[s]:' ';
+    }
+    f0[16]=f1[16]='\0';
+    lcd.setCursor(0,0); lcd.print(f0);
+    lcd.setCursor(0,1); lcd.print(f1);
+    lastLine0[0]=lastLine1[0]='\0';
+    txStep++;
+    if (txStep>=TRANSITION_STEPS) {
+      lcd.clear();
+      txState=TX_BLANK;
+      txStep=0;
+    }
+  }
+
+  else if (txState==TX_BLANK) {
+    currentScreen = nextScreen;
+    txState       = TX_IN;
+    txStep        = 0;
+  }
+
+  else if (txState==TX_IN) {
+    int sh = TRANSITION_STEPS - txStep;
+    for (int c=0;c<16;c++) {
+      int s=c-sh;
+      f0[c]=(s>=0&&s<16)?txNewL0[s]:' ';
+      f1[c]=(s>=0&&s<16)?txNewL1[s]:' ';
+    }
+    f0[16]=f1[16]='\0';
+    lcd.setCursor(0,0); lcd.print(f0);
+    lcd.setCursor(0,1); lcd.print(f1);
+    lastLine0[0]=lastLine1[0]='\0';
+    txStep++;
+    if (txStep>=TRANSITION_STEPS) {
+      txState=TX_IDLE;
+      lastLine0[0]=lastLine1[0]='\0';
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  6. Sensor scan + fault detection
+// ═══════════════════════════════════════════════════════
+bool scanForFaults(unsigned long now) {
+  bool anyFault=false;
+  activeFault=FAULT_NONE;
+  faultCellIndex=-1;
+
+  float vMin=9999,vMax=-9999,vSum=0;
+  int weakIdx=0,strongIdx=0;
+
+  for (int i=0;i<NUM_CELLS;i++) {
+    int   raw = analogRead(ADC_PINS[i]);
+    float v   = adcToVoltage(raw);
+
+    float dt=(now-mon[i].prevSampleTime)/1000.0f;
+    if (dt>0.001f)
+      mon[i].dVdt=fabsf(v-mon[i].prevVoltage)/dt;
+
+    if (mon[i].lastRawADC<0) {
+      mon[i].stuckCount=0;
+    } else if (abs(raw-mon[i].lastRawADC)<=ANOMALY_TOLERANCE) {
+      mon[i].stuckCount++;
+    } else {
+      mon[i].stuckCount=0;
+    }
+
+    bool nearDanger=(v<WEAK_THRESH+ANOMALY_MARGIN)||(v>OV_THRESH-ANOMALY_MARGIN);
+
+    if (mon[i].stuckCount>=ANOMALY_WINDOW && nearDanger) {
+      anyFault=true; activeFault=FAULT_ANOMALY; faultCellIndex=i;
+    } else if (v<WEAK_THRESH) {
+      anyFault=true; activeFault=FAULT_WEAK;    faultCellIndex=i;
+    } else if (v>OV_THRESH) {
+      anyFault=true; activeFault=FAULT_OVERVOLT; faultCellIndex=i;
+    } else if (mon[i].dVdt>DVDT_THRESH) {
+      anyFault=true; activeFault=FAULT_DVDT;    faultCellIndex=i;
+    }
+
+    cells[i].voltage      = v;
+    cells[i].socPct       = estimateSoc(v);
+    cells[i].underVoltage = (v<2.8f);
+    cells[i].overVoltage  = (v>4.15f);
+    vSum+=v;
+    if (v<vMin){vMin=v;weakIdx=i;}
+    if (v>vMax){vMax=v;strongIdx=i;}
+
+    mon[i].prevVoltage    = v;
+    mon[i].prevSampleTime = now;
+    mon[i].lastRawADC     = raw;
+  }
+
+  pack.packVoltage  = vSum;
+  pack.avgVoltage   = vSum/NUM_CELLS;
+  pack.imbalancePct = ((vMax-vMin)/pack.avgVoltage)*100.0f;
+  pack.deltaVmV     = (vMax-vMin)*1000.0f;
+  pack.weakestCell  = weakIdx;
+  pack.strongestCell= strongIdx;
+
+  float socSum=0;
+  for (int i=0;i<NUM_CELLS;i++) {
+    cells[i].imbalancePct=(fabsf(cells[i].voltage-pack.avgVoltage)/pack.avgVoltage)*100.0f;
+    cells[i].isWeakest   =(i==weakIdx);
+    cells[i].isStrongest =(i==strongIdx);
+    socSum+=cells[i].socPct;
+  }
+  pack.avgSoc=socSum/NUM_CELLS;
+  return anyFault;
+}
+
+// ═══════════════════════════════════════════════════════
+//  7. Safety state machine  ← startTransition already defined
+// ═══════════════════════════════════════════════════════
+void triggerFaultOverride() {
+  faultOverride=true;
+  txState=TX_IDLE;
+  currentScreen=SCR_FAULT;
+  lastLine0[0]=lastLine1[0]='\0';
+}
+
+void runStateMachine(bool rawFault, unsigned long now) {
+  switch(safetyState) {
+
+    case NORMAL:
+      if (rawFault) {
+        if (!faultLatchedRaw){tFaultStart=now;faultLatchedRaw=true;}
+        if (now-tFaultStart>=DEBOUNCE_TIME){
+          safetyState=FAULT_STATE;
+          triggerFaultOverride();
+          Serial.printf("[FAULT] %s Cell%d\n",faultLabel(activeFault),faultCellIndex+1);
+        }
+      } else {
+        faultLatchedRaw=false;
+      }
+      break;
+
+    case FAULT_STATE:
+      if (!rawFault){
+        safetyState=COOLDOWN_STATE;
+        tCooldownStart=now;
+        currentScreen=SCR_COOLDOWN;
+        lastLine0[0]=lastLine1[0]='\0';
+        Serial.println(F("[STATE] FAULT->COOLDOWN"));
+      }
+      break;
+
+    case COOLDOWN_STATE:
+      if (rawFault){
+        safetyState=FAULT_STATE;
+        triggerFaultOverride();
+        Serial.println(F("[STATE] COOLDOWN->FAULT"));
+      } else if (now-tCooldownStart>=COOLDOWN_TIME){
+        safetyState=NORMAL;
+        faultLatchedRaw=false;
+        faultOverride=false;
+        tLastRotate=now;
+        startTransition(SCR_PACK);  // compiles fine — defined above
+        Serial.println(F("[STATE] COOLDOWN->NORMAL"));
+      }
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  8. Rotation + refresh
+// ═══════════════════════════════════════════════════════
+void handleRotation(unsigned long now) {
+  if (faultOverride) return;
+  if (txState!=TX_IDLE) return;
+  if (now-tLastRotate>=SCREEN_ROTATE_MS) {
+    startTransition((ScreenID)((currentScreen+1)%ROTATE_COUNT));
+    tLastRotate=now;
+  }
+}
+
+void handleLCDRefresh(unsigned long now) {
+  if (txState!=TX_IDLE) return;
+  if (now-tLastLCD>=LCD_REFRESH_MS) {
+    char L0[17],L1[17];
+    buildScreen(currentScreen,L0,L1);
+    lcdWrite(L0,L1);
+    tLastLCD=now;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  for (int i=0;i<NUM_CELLS;i++){
+    pinMode(ADC_PINS[i],INPUT);
+    mon[i].prevSampleTime=millis();
+    mon[i].lastRawADC=-1;
+    mon[i].stuckCount=0;
+  }
+
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0,iconWarn);
+
+  // Splash slides in from right
+  lcd.clear();
+  const char* sp0=" HMI Diagnostic ";
+  const char* sp1="  4-Cell Li-ion ";
+  for (int shift=16;shift>=0;shift--){
+    lcd.setCursor(0,0);
+    for (int c=0;c<16;c++){int s=c-(16-shift);lcd.print((s>=0&&s<16)?sp0[s]:' ');}
+    lcd.setCursor(0,1);
+    for (int c=0;c<16;c++){int s=c-(16-shift);lcd.print((s>=0&&s<16)?sp1[s]:' ');}
+    delay(35);
+  }
+  delay(1200);
+
+  // Splash slides out, screen 1 slides in
+  strncpy(txOldL0,sp0,16); txOldL0[16]='\0';
+  strncpy(txOldL1,sp1,16); txOldL1[16]='\0';
+  buildScreen(SCR_PACK,txNewL0,txNewL1);
+  nextScreen=SCR_PACK;
+  txStep=0;
+  txState=TX_OUT;
+  tLastTxStep=millis();
+
+  tLastPoll=tLastLCD=tLastRotate=millis();
+  Serial.println(F("HMI ready."));
+}
+
+// ═══════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════
+void loop() {
+  unsigned long now=millis();
+
+  if (now-tLastPoll>=POLL_INTERVAL){
+    bool raw=scanForFaults(now);
+    runStateMachine(raw,now);
+    tLastPoll=now;
+  }
+
+  updateTransition(now);
+  handleRotation(now);
+  handleLCDRefresh(now);
+}
