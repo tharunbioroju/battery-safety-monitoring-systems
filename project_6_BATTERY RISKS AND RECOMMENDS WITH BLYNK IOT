@@ -1,0 +1,785 @@
+/********************************************************
+ * TASK 6
+ * Intelligent Cloud Telemetry Architecture
+ * ESP32 + Blynk + LCD + Battery Intelligence Engine
+ ********************************************************/
+
+#define BLYNK_TEMPLATE_ID "TMPL3spa_4PUz"
+#define BLYNK_TEMPLATE_NAME "task 6  battery IOT"
+#define BLYNK_AUTH_TOKEN "TEzHdbzMqJTYy-dwzIDz3rL4OOpi74sh"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+WidgetTerminal terminal(V9);
+
+//====================================================
+// Hardware Pins
+//====================================================
+
+#define GREEN_LED   25
+#define YELLOW_LED  26
+#define RED_LED     27
+
+#define NUM_CELLS 4
+
+const int ADC_PINS[NUM_CELLS] = { 34, 35, 32, 33 };
+
+//====================================================
+// Dashboard Mapping
+//====================================================
+
+/*
+V0  Cell1 Voltage
+V1  Cell2 Voltage
+V2  Cell3 Voltage
+V3  Cell4 Voltage
+V4  Pack Voltage
+V5  Average SOC
+V6  Imbalance %
+V7  Health Status
+V8  RSSI
+V9  Terminal Log
+V10 Risk Level
+V11 Recommendation
+V12 Weakest Cell
+V13 Strongest Cell
+V14 Green LED Widget
+V15 Yellow LED Widget
+V16 Red LED Widget
+*/
+
+//====================================================
+// Battery Limits
+//====================================================
+
+#define ADC_MAX     4095.0f
+#define V_MIN       2.5f
+#define V_MAX       4.2f
+#define WEAK_THRESH 2.8f
+#define OV_THRESH   4.15f
+
+//====================================================
+// Timers
+//====================================================
+
+#define POLL_INTERVAL      100
+#define TELEMETRY_INTERVAL 1000
+#define SIGNAL_CHECK_MS    5000
+#define WIFI_RETRY_MS      10000
+
+//====================================================
+// Health States
+//====================================================
+
+enum HealthState
+{
+  HEALTHY,
+  MINOR_IMBALANCE,
+  CRITICAL_IMBALANCE,
+  LOW_BATTERY,
+  PACK_FAILURE,
+  FAULT_STATE
+};
+
+HealthState currentHealth  = HEALTHY;
+HealthState previousHealth = HEALTHY;
+
+//====================================================
+// Cell Structure
+//====================================================
+
+struct CellData
+{
+  float voltage;
+  float soc;
+  float imbalance;
+};
+
+CellData cells[NUM_CELLS];
+
+//====================================================
+// Pack Structure
+//====================================================
+
+struct PackData
+{
+  float packVoltage;
+  float avgVoltage;
+  float avgSoc;
+  float imbalancePct;
+  int   weakestCell;
+  int   strongestCell;
+};
+
+PackData pack;
+
+//====================================================
+// Monitoring Variables
+//====================================================
+
+float previousVoltage[NUM_CELLS];
+
+int previousWeakest   = -1;
+int previousStrongest = -1;
+
+//====================================================
+// Signal / RSSI Strings
+//====================================================
+
+String currentSignalState  = "";
+String previousSignalState = "";
+
+//====================================================
+// Timers
+//====================================================
+
+unsigned long lastPoll        = 0;
+unsigned long lastTelemetry   = 0;
+unsigned long lastSignalCheck = 0;
+unsigned long lastWiFiRetry   = 0;
+unsigned long lastLCDSwitch   = 0;
+
+//====================================================
+// LCD Page
+//====================================================
+
+byte lcdPage = 0;
+
+//====================================================
+// WiFi / Blynk Status Tracking
+//====================================================
+
+bool lastWiFiState  = false;
+bool lastBlynkState = false;
+
+//====================================================
+// Event Queue
+//====================================================
+
+#define MAX_EVENTS 30
+
+struct EventItem
+{
+  String message;
+};
+
+EventItem eventQueue[MAX_EVENTS];
+
+int queueHead = 0;
+int queueTail = 0;
+
+//====================================================
+// Queue Functions
+//====================================================
+
+bool queueEmpty()  { return queueHead == queueTail; }
+bool queueFull()   { return ((queueTail + 1) % MAX_EVENTS) == queueHead; }
+
+void pushEvent(String msg)
+{
+  if (queueFull()) return;
+  eventQueue[queueTail].message = msg;
+  queueTail = (queueTail + 1) % MAX_EVENTS;
+  Serial.println("[EVENT] " + msg);
+}
+
+String popEvent()
+{
+  if (queueEmpty()) return "";
+  String msg = eventQueue[queueHead].message;
+  queueHead = (queueHead + 1) % MAX_EVENTS;
+  return msg;
+}
+
+//====================================================
+// Voltage to SOC
+//====================================================
+
+float voltageToSOC(float v)
+{
+  float soc = ((v - V_MIN) / (V_MAX - V_MIN)) * 100.0;
+  if (soc < 0)   soc = 0;
+  if (soc > 100) soc = 100;
+  return soc;
+}
+
+//====================================================
+// Signal State Label
+//====================================================
+
+String getSignalState(int rssi)
+{
+  if (rssi > -60) return "Excellent";
+  if (rssi > -70) return "Good";
+  if (rssi > -80) return "Weak";
+  return "Poor";
+}
+
+//====================================================
+// Health Labels
+//====================================================
+
+String healthLabel(HealthState state)
+{
+  switch (state)
+  {
+    case HEALTHY:            return "Healthy";
+    case MINOR_IMBALANCE:    return "MinorImbalance";
+    case CRITICAL_IMBALANCE: return "CritImbalance";
+    case LOW_BATTERY:        return "Low Battery";
+    case PACK_FAILURE:       return "Pack Failure";
+    case FAULT_STATE:        return "Fault";
+    default:                 return "Unknown";
+  }
+}
+
+//====================================================
+// Risk Level
+//====================================================
+
+String getRiskLevel()
+{
+  switch (currentHealth)
+  {
+    case HEALTHY:            return "Low Risk";
+    case MINOR_IMBALANCE:    return "Medium Risk";
+    case LOW_BATTERY:        return "High Risk";
+    case CRITICAL_IMBALANCE: return "High Risk";
+    case PACK_FAILURE:       return "CriticalRisk";
+    case FAULT_STATE:        return "CriticalRisk";
+    default:                 return "Unknown";
+  }
+}
+
+//====================================================
+// Recommendation
+//====================================================
+
+String getRecommendation()
+{
+  switch (currentHealth)
+  {
+    case HEALTHY:            return "System Normal";
+    case MINOR_IMBALANCE:    return "MonitorBalance";
+    case CRITICAL_IMBALANCE: return "InspectBattery";
+    case LOW_BATTERY:        return "Recharge Soon";
+    case PACK_FAILURE:       return "Immed. Service";
+    case FAULT_STATE:        return "Disconn. Load";
+    default:                 return "Check System";
+  }
+}
+
+//====================================================
+// Read Battery Data
+//====================================================
+
+void readBatteryData()
+{
+  float sum    = 0;
+  float minV   = 999;
+  float maxV   = -999;
+  int   weakIdx   = 0;
+  int   strongIdx = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    int   raw     = analogRead(ADC_PINS[i]);
+    float voltage = V_MIN + ((float)raw / ADC_MAX) * (V_MAX - V_MIN);
+
+    cells[i].voltage = voltage;
+    cells[i].soc     = voltageToSOC(voltage);
+
+    sum += voltage;
+
+    if (voltage < minV) { minV = voltage; weakIdx   = i; }
+    if (voltage > maxV) { maxV = voltage; strongIdx = i; }
+  }
+
+  pack.packVoltage   = sum;
+  pack.avgVoltage    = sum / NUM_CELLS;
+  pack.weakestCell   = weakIdx;
+  pack.strongestCell = strongIdx;
+  pack.imbalancePct  = ((maxV - minV) / pack.avgVoltage) * 100.0;
+
+  float socSum = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    cells[i].imbalance =
+      fabs(cells[i].voltage - pack.avgVoltage) / pack.avgVoltage * 100.0;
+    socSum += cells[i].soc;
+  }
+
+  pack.avgSoc = socSum / NUM_CELLS;
+}
+
+//====================================================
+// Determine Health State
+//====================================================
+
+HealthState determineHealth()
+{
+  bool fault = false;
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    if (cells[i].voltage < WEAK_THRESH) fault = true;
+    if (cells[i].voltage > OV_THRESH)   fault = true;
+  }
+
+  if (fault)                  return FAULT_STATE;
+  if (pack.avgSoc <= 5)       return PACK_FAILURE;
+  if (pack.avgSoc <= 20)      return LOW_BATTERY;
+  if (pack.imbalancePct > 10) return CRITICAL_IMBALANCE;
+  if (pack.imbalancePct > 3)  return MINOR_IMBALANCE;
+
+  return HEALTHY;
+}
+
+//====================================================
+// Health Events
+//====================================================
+
+void checkHealthEvents()
+{
+  currentHealth = determineHealth();
+
+  if (currentHealth != previousHealth)
+  {
+    pushEvent("Health -> " + healthLabel(currentHealth));
+    previousHealth = currentHealth;
+  }
+}
+
+//====================================================
+// Weakest Cell Change
+//====================================================
+
+void checkWeakestCellChange()
+{
+  if (previousWeakest == -1) { previousWeakest = pack.weakestCell; return; }
+
+  if (pack.weakestCell != previousWeakest)
+  {
+    pushEvent("Weakest Cell -> C" + String(pack.weakestCell + 1));
+    previousWeakest = pack.weakestCell;
+  }
+}
+
+//====================================================
+// Strongest Cell Change
+//====================================================
+
+void checkStrongestCellChange()
+{
+  if (previousStrongest == -1) { previousStrongest = pack.strongestCell; return; }
+
+  if (pack.strongestCell != previousStrongest)
+  {
+    pushEvent("Strongest Cell -> C" + String(pack.strongestCell + 1));
+    previousStrongest = pack.strongestCell;
+  }
+}
+
+//====================================================
+// Voltage Fault Events
+//====================================================
+
+void checkVoltageEvents()
+{
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    float v  = cells[i].voltage;
+    float pv = previousVoltage[i];
+
+    if (pv >= WEAK_THRESH && v < WEAK_THRESH)
+      pushEvent("Cell " + String(i + 1) + " UNDERVOLTAGE");
+
+    if (pv <= OV_THRESH && v > OV_THRESH)
+      pushEvent("Cell " + String(i + 1) + " OVERVOLTAGE");
+
+    previousVoltage[i] = v;
+  }
+}
+
+//====================================================
+// Master Event Processor
+//====================================================
+
+void processBatteryEvents()
+{
+  checkHealthEvents();
+  checkWeakestCellChange();
+  checkStrongestCellChange();
+  checkVoltageEvents();
+}
+
+//====================================================
+// WiFi Reconnect Manager
+//====================================================
+
+void handleWiFi()
+{
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  unsigned long now = millis();
+
+  if (now - lastWiFiRetry >= WIFI_RETRY_MS)
+  {
+    Serial.println("[WiFi] Retrying...");
+    WiFi.begin(ssid, pass);
+    lastWiFiRetry = now;
+  }
+}
+
+//====================================================
+// WiFi Event Detection
+//====================================================
+
+void monitorWiFiEvents()
+{
+  bool currentState = (WiFi.status() == WL_CONNECTED);
+
+  if (currentState != lastWiFiState)
+  {
+    if (currentState)
+      pushEvent("WiFi Reconnected");
+    else
+      pushEvent("WiFi Disconnected");
+
+    lastWiFiState = currentState;
+  }
+}
+
+//====================================================
+// ✅ FIX: Blynk Connected Callback
+// Runs automatically when Blynk establishes connection
+//====================================================
+
+BLYNK_CONNECTED()
+{
+  // Push status to V9 Terminal immediately on connect
+  terminal.println("======================");
+  terminal.println("  Blynk ONLINE");
+  terminal.println("  Device Connected!");
+  terminal.println("======================");
+  terminal.flush();
+
+  pushEvent("Blynk Connected");
+  lastBlynkState = true;
+
+  Serial.println("[Blynk] Connected to server!");
+}
+
+//====================================================
+// Blynk Connection Monitor (tracks disconnects)
+//====================================================
+
+void monitorBlynkEvents()
+{
+  bool currentState = Blynk.connected();
+
+  if (currentState != lastBlynkState)
+  {
+    if (!currentState)
+    {
+      pushEvent("Blynk Disconnected");
+      Serial.println("[Blynk] Disconnected!");
+    }
+    // Connection is handled by BLYNK_CONNECTED() callback above
+
+    lastBlynkState = currentState;
+  }
+}
+
+//====================================================
+// Signal / RSSI Monitoring
+//====================================================
+
+void monitorSignal()
+{
+  unsigned long now = millis();
+
+  if (now - lastSignalCheck < SIGNAL_CHECK_MS) return;
+
+  lastSignalCheck = now;
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  int rssi = WiFi.RSSI();
+
+  currentSignalState = getSignalState(rssi);
+
+  if (currentSignalState != previousSignalState)
+  {
+    pushEvent("Signal -> " + currentSignalState + " (" + String(rssi) + " dBm)");
+    previousSignalState = currentSignalState;
+  }
+}
+
+//====================================================
+// ✅ FIX: Blynk Connect with longer timeout
+//====================================================
+
+void connectBlynk()
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (Blynk.connected()) return;
+
+  // Use 5000ms timeout instead of 1000ms — gives Wokwi enough time
+  Blynk.connect(5000);
+}
+
+//====================================================
+// Dashboard Telemetry
+//====================================================
+
+void sendTelemetry()
+{
+  if (!Blynk.connected()) return;
+
+  Blynk.virtualWrite(V0,  cells[0].voltage);
+  Blynk.virtualWrite(V1,  cells[1].voltage);
+  Blynk.virtualWrite(V2,  cells[2].voltage);
+  Blynk.virtualWrite(V3,  cells[3].voltage);
+
+  Blynk.virtualWrite(V4,  pack.packVoltage);
+  Blynk.virtualWrite(V5,  pack.avgSoc);
+  Blynk.virtualWrite(V6,  pack.imbalancePct);
+
+  Blynk.virtualWrite(V7,  healthLabel(currentHealth));
+  Blynk.virtualWrite(V8,  WiFi.RSSI());
+
+  Blynk.virtualWrite(V10, getRiskLevel());
+  Blynk.virtualWrite(V11, getRecommendation());
+
+  Blynk.virtualWrite(V12, "Cell " + String(pack.weakestCell   + 1));
+  Blynk.virtualWrite(V13, "Cell " + String(pack.strongestCell + 1));
+}
+
+//====================================================
+// Severity LEDs
+//====================================================
+
+void updateSeverityLEDs()
+{
+  digitalWrite(GREEN_LED,  LOW);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(RED_LED,    LOW);
+
+  if (Blynk.connected())
+  {
+    Blynk.virtualWrite(V14, 0);
+    Blynk.virtualWrite(V15, 0);
+    Blynk.virtualWrite(V16, 0);
+  }
+
+  switch (currentHealth)
+  {
+    case HEALTHY:
+      digitalWrite(GREEN_LED, HIGH);
+      if (Blynk.connected()) Blynk.virtualWrite(V14, 255);
+      break;
+
+    case MINOR_IMBALANCE:
+    case LOW_BATTERY:
+      digitalWrite(YELLOW_LED, HIGH);
+      if (Blynk.connected()) Blynk.virtualWrite(V15, 255);
+      break;
+
+    case CRITICAL_IMBALANCE:
+    case PACK_FAILURE:
+    case FAULT_STATE:
+      digitalWrite(RED_LED, HIGH);
+      if (Blynk.connected()) Blynk.virtualWrite(V16, 255);
+      break;
+  }
+}
+
+//====================================================
+// Queue Synchronization → V9 Terminal
+//====================================================
+
+void syncEventQueue()
+{
+  if (!Blynk.connected()) return;
+
+  // Flush up to 3 events per cycle to avoid flooding
+  int count = 0;
+  while (!queueEmpty() && count < 3)
+  {
+    String msg = popEvent();
+    terminal.println(msg);
+    terminal.flush();
+    count++;
+  }
+}
+
+//====================================================
+// LCD Pages (0-5)
+//====================================================
+
+void updateLCD()
+{
+  unsigned long now = millis();
+
+  if (now - lastLCDSwitch < 3000) return;
+
+  lastLCDSwitch = now;
+
+  lcdPage++;
+  if (lcdPage > 5) lcdPage = 0;
+
+  lcd.clear();
+
+  switch (lcdPage)
+  {
+    case 0:
+      lcd.setCursor(0, 0); lcd.print("Pack:"); lcd.print(pack.packVoltage, 1); lcd.print("V");
+      lcd.setCursor(0, 1); lcd.print("SOC:");  lcd.print(pack.avgSoc, 0);      lcd.print("%");
+      break;
+
+    case 1:
+      lcd.setCursor(0, 0);
+      lcd.print("C1:"); lcd.print(cells[0].voltage, 2);
+      lcd.print(" C2:"); lcd.print(cells[1].voltage, 2);
+      lcd.setCursor(0, 1);
+      lcd.print("C3:"); lcd.print(cells[2].voltage, 2);
+      lcd.print(" C4:"); lcd.print(cells[3].voltage, 2);
+      break;
+
+    case 2:
+      lcd.setCursor(0, 0); lcd.print("Health:");
+      lcd.setCursor(0, 1); lcd.print(healthLabel(currentHealth));
+      break;
+
+    case 3:
+      lcd.setCursor(0, 0); lcd.print("Weak:  C"); lcd.print(pack.weakestCell   + 1);
+      lcd.setCursor(0, 1); lcd.print("Strong:C"); lcd.print(pack.strongestCell + 1);
+      break;
+
+    case 4:
+      lcd.setCursor(0, 0); lcd.print("Risk:"); lcd.print(getRiskLevel());
+      lcd.setCursor(0, 1); lcd.print(getRecommendation());
+      break;
+
+    case 5:
+      lcd.setCursor(0, 0); lcd.print("SOC:");   lcd.print(pack.avgSoc, 1);      lcd.print("%");
+      lcd.setCursor(0, 1); lcd.print("Imbal:"); lcd.print(pack.imbalancePct, 2); lcd.print("%");
+      break;
+  }
+}
+
+//====================================================
+// SETUP
+//====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(GREEN_LED,  OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED,    OUTPUT);
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    pinMode(ADC_PINS[i], INPUT);
+    previousVoltage[i] = V_MAX;
+  }
+
+  // ✅ FIX: Wait for WiFi before configuring Blynk
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Connecting WiFi");
+  Serial.println("[WiFi] Connecting to Wokwi-GUEST...");
+
+  WiFi.begin(ssid, pass);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
+    lastWiFiState = true;
+
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("WiFi OK");
+    lcd.setCursor(0, 1); lcd.print(WiFi.localIP().toString());
+    delay(1000);
+  }
+  else
+  {
+    Serial.println("\n[WiFi] Failed to connect!");
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("WiFi FAILED");
+  }
+
+  // ✅ FIX: Config Blynk AFTER WiFi is up
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect(10000); // 10 second timeout for initial connect
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Task 6 System");
+  lcd.setCursor(0, 1);
+  lcd.print(Blynk.connected() ? "Blynk: ONLINE" : "Blynk: OFFLINE");
+
+  pushEvent("System Started");
+}
+
+//====================================================
+// LOOP
+//====================================================
+
+void loop()
+{
+  unsigned long now = millis();
+
+  Blynk.run();
+
+  handleWiFi();
+  connectBlynk();
+
+  monitorWiFiEvents();
+  monitorBlynkEvents();
+  monitorSignal();
+
+  // Battery Engine
+  if (now - lastPoll >= POLL_INTERVAL)
+  {
+    readBatteryData();
+    processBatteryEvents();
+    updateSeverityLEDs();
+    lastPoll = now;
+  }
+
+  // Cloud Telemetry
+  if (now - lastTelemetry >= TELEMETRY_INTERVAL)
+  {
+    sendTelemetry();
+    syncEventQueue();
+    lastTelemetry = now;
+  }
+
+  // LCD
+  updateLCD();
+}
