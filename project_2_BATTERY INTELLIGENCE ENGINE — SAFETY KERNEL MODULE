@@ -1,0 +1,317 @@
+// ═══════════════════════════════════════════════════════
+//  Event-Driven Safety Protection Kernel
+//  Architecture : non-blocking, millis()-based, no delay()
+//  Detects      : weak cell, overvoltage, sensor anomaly,
+//                 rapid voltage fluctuation (dV/dt)
+//  Controls     : relay cutoff, buzzer, LCD warning
+//  Protection   : debounce + cooldown + relay anti-chatter
+// ═══════════════════════════════════════════════════════
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ── Pin map ────────────────────────────────────────────
+#define NUM_CELLS    4
+const int ADC_PINS[NUM_CELLS] = {34, 35, 32, 33};
+#define RELAY_PIN    27
+#define BUZZER_PIN   26
+
+// ── Voltage limits ─────────────────────────────────────
+#define ADC_MAX        4095.0f
+#define V_MIN          2.5f
+#define V_MAX          4.2f
+#define WEAK_THRESH    2.8f      // weak cell fault
+#define OV_THRESH      4.15f     // overvoltage fault
+#define DVDT_THRESH    0.15f     // volts/second — fluctuation fault
+
+// ── Sensor anomaly tuning ──────────────────────────────
+#define ANOMALY_WINDOW     100   // consecutive idle polls before flagged (≈10s @100ms)
+#define ANOMALY_TOLERANCE  2     // ADC counts treated as "no real change" (jitter band)
+#define ANOMALY_MARGIN     0.10f // volts away from a threshold to count as "suspicious"
+
+// ── Timing constants — all millis() based ─────────────
+#define POLL_INTERVAL      100    // sensor poll rate
+#define DEBOUNCE_TIME      500    // fault must persist this long
+#define COOLDOWN_TIME      3000   // stable time required before reclose
+#define RELAY_MIN_INTERVAL 2000   // anti-chatter: min time between toggles
+#define BUZZER_ON_TIME     150    // beep on duration
+#define BUZZER_OFF_TIME    350    // beep off duration
+#define LCD_REFRESH        500    // LCD update rate
+
+// ── Fault state machine ───────────────────────────────
+enum SafetyState { NORMAL, FAULT, COOLDOWN };
+SafetyState state = NORMAL;
+
+enum FaultType { FAULT_NONE, FAULT_WEAK, FAULT_OVERVOLT, FAULT_ANOMALY, FAULT_DVDT };
+FaultType activeFault = FAULT_NONE;
+int       faultCellIndex = -1;
+
+// ── Per-cell tracking data ────────────────────────────
+struct CellMonitor {
+  float voltage;
+  float prevVoltage;
+  unsigned long prevSampleTime;
+  float dVdt;                 // volts per second
+  int   stuckCount;           // consecutive near-identical readings
+  int   lastRawADC;
+};
+CellMonitor mon[NUM_CELLS];
+
+// ── Event timers — millis() snapshots ─────────────────
+unsigned long tLastPoll        = 0;
+unsigned long tFaultStart      = 0;     // when current fault condition first seen
+unsigned long tCooldownStart   = 0;     // when cooldown began
+unsigned long tLastRelayChange = 0;     // anti-chatter timestamp
+unsigned long tBuzzerToggle    = 0;
+unsigned long tLastLCD         = 0;
+
+bool buzzerActive = false;
+bool buzzerState  = false;
+bool relayClosed  = true;
+bool faultLatchedRaw = false;   // raw (pre-debounce) fault flag
+
+// ── Module 1: ADC read (single sample — non-blocking) ─
+int readADC(int pin) {
+  return analogRead(pin);
+}
+
+float adcToVoltage(int raw) {
+  return V_MIN + (raw / ADC_MAX) * (V_MAX - V_MIN);
+}
+
+// ── Module 2: Per-cell fault detection ────────────────
+// Returns true if ANY fault condition is currently active (raw, pre-debounce)
+bool scanForFaults(unsigned long now) {
+  bool anyFault = false;
+  activeFault = FAULT_NONE;
+  faultCellIndex = -1;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+    int raw = readADC(ADC_PINS[i]);
+    float v = adcToVoltage(raw);
+
+    // ── dV/dt calculation ──────────────────────────────
+    float dt = (now - mon[i].prevSampleTime) / 1000.0f;  // seconds
+    if (dt > 0.001f) {
+      mon[i].dVdt = fabsf(v - mon[i].prevVoltage) / dt;
+    }
+
+    // ── Sensor anomaly: stuck ADC detection (tolerance band) ──
+    if (mon[i].lastRawADC < 0) {
+      mon[i].stuckCount = 0;            // first sample ever, nothing to compare
+    } else if (abs(raw - mon[i].lastRawADC) <= ANOMALY_TOLERANCE) {
+      mon[i].stuckCount++;
+    } else {
+      mon[i].stuckCount = 0;
+    }
+
+    // ── Anomaly only matters if frozen value is ALSO near a danger threshold ──
+    bool nearDanger = (v < WEAK_THRESH + ANOMALY_MARGIN) ||
+                       (v > OV_THRESH  - ANOMALY_MARGIN);
+    bool stuckAndSuspicious = (mon[i].stuckCount >= ANOMALY_WINDOW) && nearDanger;
+
+    // ── Check fault conditions, priority order ─────────
+    if (stuckAndSuspicious) {
+      anyFault = true;
+      activeFault = FAULT_ANOMALY;
+      faultCellIndex = i;
+    }
+    else if (v < WEAK_THRESH) {
+      anyFault = true;
+      activeFault = FAULT_WEAK;
+      faultCellIndex = i;
+    }
+    else if (v > OV_THRESH) {
+      anyFault = true;
+      activeFault = FAULT_OVERVOLT;
+      faultCellIndex = i;
+    }
+    else if (mon[i].dVdt > DVDT_THRESH) {
+      anyFault = true;
+      activeFault = FAULT_DVDT;
+      faultCellIndex = i;
+    }
+
+    // ── Update tracking state ──────────────────────────
+    mon[i].voltage        = v;
+    mon[i].prevVoltage    = v;
+    mon[i].prevSampleTime = now;
+    mon[i].lastRawADC     = raw;
+  }
+  return anyFault;
+}
+
+// ── Module 3: Relay driver with anti-chatter ──────────
+void setRelay(bool closeRelay, unsigned long now) {
+  if (closeRelay == relayClosed) return;             // no change needed
+  if (now - tLastRelayChange < RELAY_MIN_INTERVAL) return;  // chatter guard
+
+  relayClosed = closeRelay;
+  digitalWrite(RELAY_PIN, relayClosed ? HIGH : LOW);  // active-HIGH relay
+  tLastRelayChange = now;
+
+  Serial.print(F("[RELAY] "));
+  Serial.println(relayClosed ? "CLOSED (power restored)" : "OPEN (cutoff)");
+}
+
+// ── Module 4: Buzzer driver — non-blocking beep pattern
+void updateBuzzer(unsigned long now) {
+  if (!buzzerActive) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerState = false;
+    return;
+  }
+  unsigned long interval = buzzerState ? BUZZER_ON_TIME : BUZZER_OFF_TIME;
+  if (now - tBuzzerToggle >= interval) {
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    tBuzzerToggle = now;
+  }
+}
+
+// ── Module 5: Safety state machine ────────────────────
+const char* faultLabel(FaultType f) {
+  switch (f) {
+    case FAULT_WEAK:      return "WEAK CELL";
+    case FAULT_OVERVOLT:  return "OVERVOLTAGE";
+    case FAULT_ANOMALY:   return "SENSOR FAULT";
+    case FAULT_DVDT:      return "VOLT SPIKE";
+    default:               return "NONE";
+  }
+}
+
+void runStateMachine(bool rawFault, unsigned long now) {
+  switch (state) {
+
+    case NORMAL:
+      if (rawFault) {
+        if (!faultLatchedRaw) {
+          tFaultStart = now;          // start debounce timer
+          faultLatchedRaw = true;
+        }
+        if (now - tFaultStart >= DEBOUNCE_TIME) {
+          // Confirmed fault — transition to FAULT state
+          state = FAULT;
+          buzzerActive = true;
+          setRelay(false, now);       // immediate cutoff
+          Serial.print(F("[STATE] NORMAL -> FAULT  ("));
+          Serial.print(faultLabel(activeFault));
+          Serial.print(F(" on cell "));
+          Serial.print(faultCellIndex + 1);
+          Serial.println(F(")"));
+        }
+      } else {
+        faultLatchedRaw = false;      // condition cleared before debounce confirmed
+      }
+      break;
+
+    case FAULT:
+      if (!rawFault) {
+        // Condition looks clear — start cooldown verification
+        state = COOLDOWN;
+        tCooldownStart = now;
+        Serial.println(F("[STATE] FAULT -> COOLDOWN (verifying stability)"));
+      }
+      // stays latched in FAULT while rawFault is true; buzzer + relay stay tripped
+      break;
+
+    case COOLDOWN:
+      if (rawFault) {
+        // Fault reappeared during cooldown — snap back immediately
+        state = FAULT;
+        Serial.println(F("[STATE] COOLDOWN -> FAULT (fault returned)"));
+      }
+      else if (now - tCooldownStart >= COOLDOWN_TIME) {
+        // Stable for the full cooldown window — safe to restore
+        state = NORMAL;
+        buzzerActive = false;
+        faultLatchedRaw = false;
+        setRelay(true, now);
+        Serial.println(F("[STATE] COOLDOWN -> NORMAL (relay restored)"));
+      }
+      break;
+  }
+}
+
+// ── Module 6: LCD warning display ─────────────────────
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+
+  switch (state) {
+    case NORMAL:
+      lcd.print("SYSTEM NORMAL");
+      lcd.setCursor(0, 1);
+      lcd.print("Relay: CLOSED");
+      break;
+
+    case FAULT:
+      lcd.print("!! FAULT !! C");
+      lcd.print(faultCellIndex + 1);
+      lcd.setCursor(0, 1);
+      lcd.print(faultLabel(activeFault));
+      lcd.print(" CUT");
+      break;
+
+    case COOLDOWN:
+      lcd.print("Verifying...");
+      lcd.setCursor(0, 1);
+      lcd.print("Relay OPEN");
+      break;
+  }
+}
+
+// ── Setup ──────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(200);  // one-time startup delay only, never used in loop
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  for (int i = 0; i < NUM_CELLS; i++) {
+    pinMode(ADC_PINS[i], INPUT);
+    mon[i].prevSampleTime = millis();
+    mon[i].lastRawADC = -1;     // -1 = "no reading yet", skips first stuck-check
+    mon[i].stuckCount  = 0;
+  }
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);   // start closed (active-HIGH)
+  digitalWrite(BUZZER_PIN, LOW);
+  relayClosed = true;
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Safety Kernel");
+  lcd.setCursor(0, 1);
+  lcd.print("Booting...");
+  delay(1000);  // one-time splash, not in loop
+
+  tLastPoll = tLastLCD = millis();
+  Serial.println(F("Safety kernel online. State: NORMAL"));
+}
+
+// ── Main loop — pure event-driven, zero delay() ───────
+void loop() {
+  unsigned long now = millis();
+
+  // Task 1: poll sensors + detect faults
+  if (now - tLastPoll >= POLL_INTERVAL) {
+    bool raw = scanForFaults(now);
+    runStateMachine(raw, now);
+    tLastPoll = now;
+  }
+
+  // Task 2: drive buzzer pattern (runs every loop, near-zero cost)
+  updateBuzzer(now);
+
+  // Task 3: refresh LCD
+  if (now - tLastLCD >= LCD_REFRESH) {
+    updateLCD();
+    tLastLCD = now;
+  }
+}
